@@ -27,7 +27,8 @@ function readSmtpConfig(): SmtpConfig | null {
     return null;
   }
 
-  const port = Number(process.env.SMTP_PORT ?? "587");
+  const portRaw = process.env.SMTP_PORT?.trim() ?? "587";
+  const port = /^\d+$/.test(portRaw) ? Number(portRaw) : 587;
   const secure = String(process.env.SMTP_SECURE ?? "false").toLowerCase() === "true";
 
   return {

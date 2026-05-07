@@ -1,4 +1,5 @@
 import express, { type Request, type Response } from "express";
+import rateLimit from "express-rate-limit";
 import type { AppDatabase } from "./database.js";
 import {
   clearSessionCookie,
@@ -41,14 +42,28 @@ type SessionUserRow = {
   email: string;
 };
 
-type RateLimitEntry = {
-  count: number;
-  resetAt: number;
-};
-
-const loginRateLimit = new Map<string, RateLimitEntry>();
 const resetTokenCookieName = "reset_token";
 const resetTokenCookieMaxAge = 60 * 60;
+const authRateLimitWindowMs = 15 * 60 * 1000;
+const authRateLimitMax = 10;
+const authLimiter = rateLimit({
+  windowMs: authRateLimitWindowMs,
+  max: authRateLimitMax,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (_req, res) => {
+    res.status(429).json({ error: "Too many attempts. Please try again later." });
+  },
+});
+const htmlAuthLimiter = rateLimit({
+  windowMs: authRateLimitWindowMs,
+  max: authRateLimitMax,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (_req, res) => {
+    res.status(429).type("text/plain").send("Too many attempts. Please try again later.");
+  },
+});
 
 function escapeHtml(input: string): string {
   return input
@@ -140,28 +155,6 @@ function createTransientCookie(name: string, value: string, maxAgeSeconds: numbe
 function clearTransientCookie(name: string): string {
   const securePart = isProduction() ? "; Secure" : "";
   return `${name}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0${securePart}`;
-}
-
-function enforceRateLimit(req: Request, res: Response, key: string, maxAttempts: number, windowMs: number): boolean {
-  const source = req.ip ?? "unknown";
-  const compoundKey = `${key}:${source}`;
-  const now = Date.now();
-  const entry = loginRateLimit.get(compoundKey);
-
-  if (!entry || entry.resetAt <= now) {
-    loginRateLimit.set(compoundKey, { count: 1, resetAt: now + windowMs });
-    return true;
-  }
-
-  if (entry.count >= maxAttempts) {
-    const secondsLeft = Math.max(Math.ceil((entry.resetAt - now) / 1000), 1);
-    res.setHeader("Retry-After", String(secondsLeft));
-    return false;
-  }
-
-  entry.count += 1;
-  loginRateLimit.set(compoundKey, entry);
-  return true;
 }
 
 function getSessionUser(db: AppDatabase, req: Request): SessionUserRow | undefined {
@@ -421,11 +414,7 @@ export function createApp(db: AppDatabase) {
     return res.json({ success: true });
   });
 
-  app.post("/api/auth/login", (req: Request, res: Response) => {
-    if (!enforceRateLimit(req, res, "api-login", 10, 15 * 60 * 1000)) {
-      return res.status(429).json({ error: "Too many login attempts. Please try again later." });
-    }
-
+  app.post("/api/auth/login", authLimiter, (req: Request, res: Response) => {
     const email = normalizeEmail(String(req.body.email ?? ""));
     const password = String(req.body.password ?? "");
 
@@ -477,11 +466,7 @@ export function createApp(db: AppDatabase) {
     return res.json({ success: true, message: "If the account exists, a reset email has been sent." });
   });
 
-  app.post("/api/auth/reset-password", (req: Request, res: Response) => {
-    if (!enforceRateLimit(req, res, "api-reset-password", 10, 15 * 60 * 1000)) {
-      return res.status(429).json({ error: "Too many reset attempts. Please try again later." });
-    }
-
+  app.post("/api/auth/reset-password", authLimiter, (req: Request, res: Response) => {
     const token = String(req.body.token ?? "").trim();
     const newPassword = String(req.body.newPassword ?? "");
 
@@ -667,8 +652,9 @@ export function createApp(db: AppDatabase) {
   });
 
   app.get("/auth/login", (req: Request, res: Response) => {
-    const signupMessage = req.query.signup ? "<p>Account created. Check your email for verification.</p>" : "";
-    const verifiedMessage = req.query.verified ? "<p>Email verified. You can log in now.</p>" : "";
+    const signupMessage = req.query.signup === "1" ? "<p>Account created. Check your email for verification.</p>" : "";
+    const verifiedMessage = req.query.verified === "1" ? "<p>Email verified. You can log in now.</p>" : "";
+    const resetMessage = req.query.reset === "1" ? "<p>Password reset. You can log in now.</p>" : "";
 
     res.type("html").send(`
       <!doctype html>
@@ -677,6 +663,7 @@ export function createApp(db: AppDatabase) {
           <h1>Login</h1>
           ${signupMessage}
           ${verifiedMessage}
+          ${resetMessage}
           <form method="post" action="/auth/login">
             <label>Email <input type="email" name="email" required /></label>
             <label>Password <input type="password" name="password" required /></label>
@@ -689,11 +676,7 @@ export function createApp(db: AppDatabase) {
     `);
   });
 
-  app.post("/auth/login", (req: Request, res: Response) => {
-    if (!enforceRateLimit(req, res, "html-login", 10, 15 * 60 * 1000)) {
-      return res.status(429).type("text/plain").send("Too many login attempts. Please try again later.");
-    }
-
+  app.post("/auth/login", htmlAuthLimiter, (req: Request, res: Response) => {
     const email = normalizeEmail(String(req.body.email ?? ""));
     const password = String(req.body.password ?? "");
 
@@ -813,11 +796,7 @@ export function createApp(db: AppDatabase) {
     `);
   });
 
-  app.post("/auth/reset-password", (req: Request, res: Response) => {
-    if (!enforceRateLimit(req, res, "html-reset-password", 10, 15 * 60 * 1000)) {
-      return res.status(429).type("text/plain").send("Too many reset attempts. Please try again later.");
-    }
-
+  app.post("/auth/reset-password", htmlAuthLimiter, (req: Request, res: Response) => {
     const cookies = parseCookies(req.headers.cookie);
     const token = String(cookies[resetTokenCookieName] ?? "").trim();
     const newPassword = String(req.body.newPassword ?? "");
