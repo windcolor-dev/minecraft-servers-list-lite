@@ -478,6 +478,10 @@ export function createApp(db: AppDatabase) {
   });
 
   app.post("/api/auth/reset-password", (req: Request, res: Response) => {
+    if (!enforceRateLimit(req, res, "api-reset-password", 10, 15 * 60 * 1000)) {
+      return res.status(429).json({ error: "Too many reset attempts. Please try again later." });
+    }
+
     const token = String(req.body.token ?? "").trim();
     const newPassword = String(req.body.newPassword ?? "");
 
@@ -810,6 +814,10 @@ export function createApp(db: AppDatabase) {
   });
 
   app.post("/auth/reset-password", (req: Request, res: Response) => {
+    if (!enforceRateLimit(req, res, "html-reset-password", 10, 15 * 60 * 1000)) {
+      return res.status(429).type("text/plain").send("Too many reset attempts. Please try again later.");
+    }
+
     const cookies = parseCookies(req.headers.cookie);
     const token = String(cookies[resetTokenCookieName] ?? "").trim();
     const newPassword = String(req.body.newPassword ?? "");
