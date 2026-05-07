@@ -1,24 +1,20 @@
 import path from "node:path";
 import fs from "node:fs";
-import sqlite3 from "sqlite3";
-import { open, type Database } from "sqlite";
+import { DatabaseSync } from "node:sqlite";
 
-export type AppDatabase = Database<sqlite3.Database, sqlite3.Statement>;
+export type AppDatabase = DatabaseSync;
 
 const dataDir = path.resolve(process.cwd(), "data");
 const dbPath = path.join(dataDir, "minecraft-servers-list.db");
 
-export async function openDatabase(): Promise<AppDatabase> {
+export function openDatabase(): AppDatabase {
   fs.mkdirSync(dataDir, { recursive: true });
 
-  const db = await open({
-    filename: dbPath,
-    driver: sqlite3.Database,
-  });
+  const db = new DatabaseSync(dbPath);
 
-  await db.exec("PRAGMA foreign_keys = ON;");
+  db.exec("PRAGMA foreign_keys = ON;");
 
-  await db.exec(`
+  db.exec(`
     CREATE TABLE IF NOT EXISTS categories (
       category_id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL UNIQUE,
@@ -56,13 +52,12 @@ export async function openDatabase(): Promise<AppDatabase> {
     );
   `);
 
-  const categoryCount = await db.get<{ count: number }>("SELECT COUNT(*) as count FROM categories");
+  const categoryCount = db
+    .prepare("SELECT COUNT(*) as count FROM categories")
+    .get() as { count: number };
   if (!categoryCount || categoryCount.count === 0) {
-    await db.run(
-      "INSERT INTO categories (name, description) VALUES (?, ?)",
-      "Minecraft",
-      "Default category"
-    );
+    db.prepare("INSERT INTO categories (name, description) VALUES (?, ?)")
+      .run("Minecraft", "Default category");
   }
 
   return db;

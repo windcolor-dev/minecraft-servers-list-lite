@@ -3,8 +3,8 @@ import { openDatabase } from "./database.js";
 
 const port = Number(process.env.PORT ?? "3000");
 
-async function bootstrap() {
-  const db = await openDatabase();
+function bootstrap() {
+  const db = openDatabase();
   const app = createApp(db);
 
   app.listen(port, () => {
@@ -12,7 +12,9 @@ async function bootstrap() {
   });
 }
 
-bootstrap().catch((error) => {
+try {
+  bootstrap();
+} catch (error) {
   console.error("Failed to start application", error);
   process.exit(1);
-});
+}

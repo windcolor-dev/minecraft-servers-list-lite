@@ -58,6 +58,19 @@ function validateServerPayload(body: Record<string, unknown>): { valid: true; va
   };
 }
 
+function queryAll<T>(db: AppDatabase, sql: string, ...params: Array<string | number>): T[] {
+  return db.prepare(sql).all(...params) as T[];
+}
+
+function queryOne<T>(db: AppDatabase, sql: string, ...params: Array<string | number>): T | undefined {
+  return db.prepare(sql).get(...params) as T | undefined;
+}
+
+function execute(db: AppDatabase, sql: string, ...params: Array<string | number>): number {
+  const result = db.prepare(sql).run(...params) as { lastInsertRowid?: number };
+  return Number(result.lastInsertRowid ?? 0);
+}
+
 export function createApp(db: AppDatabase) {
   const app = express();
 
@@ -69,7 +82,7 @@ export function createApp(db: AppDatabase) {
     res.json({ ok: true });
   });
 
-  app.get("/api/servers", async (req, res) => {
+  app.get("/api/servers", (req, res) => {
     const limit = Math.min(parsePositiveInt(req.query.limit, 10), 100);
     const offset = Math.max(Number(req.query.offset ?? 0) || 0, 0);
     const categoryId = Number(req.query.categoryId ?? 0);
@@ -80,7 +93,8 @@ export function createApp(db: AppDatabase) {
       params.push(categoryId);
     }
 
-    const servers = await db.all<ServerRow[]>(
+    const servers = queryAll<ServerRow>(
+      db,
       `SELECT s.* FROM servers s ${filters} ORDER BY s.votes DESC, s.server_id DESC LIMIT ? OFFSET ?`,
       ...params,
       limit,
@@ -90,13 +104,13 @@ export function createApp(db: AppDatabase) {
     res.json({ servers, limit, offset });
   });
 
-  app.get("/api/servers/:id", async (req, res) => {
+  app.get("/api/servers/:id", (req, res) => {
     const id = parsePositiveInt(req.params.id, -1);
     if (id < 1) {
       return res.status(400).json({ error: "Invalid server id." });
     }
 
-    const server = await db.get<ServerRow>("SELECT * FROM servers WHERE server_id = ?", id);
+    const server = queryOne<ServerRow>(db, "SELECT * FROM servers WHERE server_id = ?", id);
     if (!server) {
       return res.status(404).json({ error: "Server not found." });
     }
@@ -104,18 +118,23 @@ export function createApp(db: AppDatabase) {
     return res.json({ server });
   });
 
-  app.post("/api/servers", async (req, res) => {
+  app.post("/api/servers", (req, res) => {
     const payload = validateServerPayload(req.body as Record<string, unknown>);
     if (!payload.valid) {
       return res.status(400).json({ error: payload.error });
     }
 
-    const category = await db.get<{ category_id: number }>("SELECT category_id FROM categories WHERE category_id = ?", payload.value.categoryId);
+    const category = queryOne<{ category_id: number }>(
+      db,
+      "SELECT category_id FROM categories WHERE category_id = ?",
+      payload.value.categoryId
+    );
     if (!category) {
       return res.status(400).json({ error: "Category not found." });
     }
 
-    const result = await db.run(
+    const serverId = execute(
+      db,
       `INSERT INTO servers (category_id, address, connection_port, query_port, name, description, date_added)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
       payload.value.categoryId,
@@ -127,27 +146,33 @@ export function createApp(db: AppDatabase) {
       new Date().toISOString()
     );
 
-    return res.status(201).json({ serverId: result.lastID });
+    return res.status(201).json({ serverId });
   });
 
-  app.post("/api/servers/:id/votes", async (req, res) => {
+  app.post("/api/servers/:id/votes", (req, res) => {
     const id = parsePositiveInt(req.params.id, -1);
     if (id < 1) {
       return res.status(400).json({ error: "Invalid server id." });
     }
 
-    const server = await db.get<{ server_id: number }>("SELECT server_id FROM servers WHERE server_id = ?", id);
+    const server = queryOne<{ server_id: number }>(db, "SELECT server_id FROM servers WHERE server_id = ?", id);
     if (!server) {
       return res.status(404).json({ error: "Server not found." });
     }
 
-    await db.run("UPDATE servers SET votes = votes + 1 WHERE server_id = ?", id);
-    await db.run("INSERT INTO votes (server_id, ip, timestamp) VALUES (?, ?, ?)", id, req.ip, Date.now());
+    execute(db, "UPDATE servers SET votes = votes + 1 WHERE server_id = ?", id);
+    execute(
+      db,
+      "INSERT INTO votes (server_id, ip, timestamp) VALUES (?, ?, ?)",
+      id,
+      req.ip ?? "unknown",
+      Date.now()
+    );
 
     return res.status(201).json({ success: true });
   });
 
-  app.post("/api/servers/:id/reports", async (req, res) => {
+  app.post("/api/servers/:id/reports", (req, res) => {
     const id = parsePositiveInt(req.params.id, -1);
     if (id < 1) {
       return res.status(400).json({ error: "Invalid server id." });
@@ -158,15 +183,16 @@ export function createApp(db: AppDatabase) {
       return res.status(400).json({ error: "Message must be between 5 and 2000 characters." });
     }
 
-    const server = await db.get<{ server_id: number }>("SELECT server_id FROM servers WHERE server_id = ?", id);
+    const server = queryOne<{ server_id: number }>(db, "SELECT server_id FROM servers WHERE server_id = ?", id);
     if (!server) {
       return res.status(404).json({ error: "Server not found." });
     }
 
-    await db.run(
+    execute(
+      db,
       "INSERT INTO reports (server_id, ip_address, message, date) VALUES (?, ?, ?, ?)",
       id,
-      req.ip,
+      req.ip ?? "unknown",
       message,
       new Date().toISOString()
     );
@@ -174,8 +200,11 @@ export function createApp(db: AppDatabase) {
     return res.status(201).json({ success: true });
   });
 
-  app.get("/", async (_req: Request, res: Response) => {
-    const servers = await db.all<ServerRow[]>("SELECT * FROM servers ORDER BY votes DESC, server_id DESC LIMIT 50");
+  app.get("/", (_req: Request, res: Response) => {
+    const servers = queryAll<ServerRow>(
+      db,
+      "SELECT * FROM servers ORDER BY votes DESC, server_id DESC LIMIT 50"
+    );
 
     const listMarkup = servers.length
       ? servers
@@ -236,18 +265,23 @@ export function createApp(db: AppDatabase) {
     `);
   });
 
-  app.post("/servers/submit", async (req, res) => {
+  app.post("/servers/submit", (req, res) => {
     const payload = validateServerPayload(req.body as Record<string, unknown>);
     if (!payload.valid) {
       return res.status(400).type("text/plain").send(payload.error);
     }
 
-    const category = await db.get<{ category_id: number }>("SELECT category_id FROM categories WHERE category_id = ?", payload.value.categoryId);
+    const category = queryOne<{ category_id: number }>(
+      db,
+      "SELECT category_id FROM categories WHERE category_id = ?",
+      payload.value.categoryId
+    );
     if (!category) {
       return res.status(400).type("text/plain").send("Category not found.");
     }
 
-    await db.run(
+    execute(
+      db,
       `INSERT INTO servers (category_id, address, connection_port, query_port, name, description, date_added)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
       payload.value.categoryId,
@@ -262,19 +296,25 @@ export function createApp(db: AppDatabase) {
     return res.redirect("/");
   });
 
-  app.post("/servers/:id/vote", async (req, res) => {
+  app.post("/servers/:id/vote", (req, res) => {
     const id = parsePositiveInt(req.params.id, -1);
     if (id < 1) {
       return res.status(400).type("text/plain").send("Invalid server id.");
     }
 
-    const server = await db.get<{ server_id: number }>("SELECT server_id FROM servers WHERE server_id = ?", id);
+    const server = queryOne<{ server_id: number }>(db, "SELECT server_id FROM servers WHERE server_id = ?", id);
     if (!server) {
       return res.status(404).type("text/plain").send("Server not found.");
     }
 
-    await db.run("UPDATE servers SET votes = votes + 1 WHERE server_id = ?", id);
-    await db.run("INSERT INTO votes (server_id, ip, timestamp) VALUES (?, ?, ?)", id, req.ip, Date.now());
+    execute(db, "UPDATE servers SET votes = votes + 1 WHERE server_id = ?", id);
+    execute(
+      db,
+      "INSERT INTO votes (server_id, ip, timestamp) VALUES (?, ?, ?)",
+      id,
+      req.ip ?? "unknown",
+      Date.now()
+    );
 
     return res.redirect("/");
   });
