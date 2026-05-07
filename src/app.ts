@@ -1,5 +1,20 @@
 import express, { type Request, type Response } from "express";
 import type { AppDatabase } from "./database.js";
+import {
+  clearSessionCookie,
+  createSessionCookie,
+  generateToken,
+  hashPassword,
+  hashToken,
+  isValidEmail,
+  isValidPassword,
+  normalizeEmail,
+  parseCookies,
+  verifyPassword,
+} from "./auth.js";
+import { createMailer } from "./mailer.js";
+
+type SqlParam = string | number | null;
 
 type ServerRow = {
   server_id: number;
@@ -11,6 +26,19 @@ type ServerRow = {
   description: string;
   date_added: string;
   votes: number;
+};
+
+type UserRow = {
+  user_id: number;
+  email: string;
+  password_hash: string;
+  password_salt: string;
+  is_email_verified: number;
+};
+
+type SessionUserRow = {
+  user_id: number;
+  email: string;
 };
 
 function escapeHtml(input: string): string {
@@ -58,17 +86,113 @@ function validateServerPayload(body: Record<string, unknown>): { valid: true; va
   };
 }
 
-function queryAll<T>(db: AppDatabase, sql: string, ...params: Array<string | number>): T[] {
+function queryAll<T>(db: AppDatabase, sql: string, ...params: SqlParam[]): T[] {
   return db.prepare(sql).all(...params) as T[];
 }
 
-function queryOne<T>(db: AppDatabase, sql: string, ...params: Array<string | number>): T | undefined {
+function queryOne<T>(db: AppDatabase, sql: string, ...params: SqlParam[]): T | undefined {
   return db.prepare(sql).get(...params) as T | undefined;
 }
 
-function execute(db: AppDatabase, sql: string, ...params: Array<string | number>): number {
+function execute(db: AppDatabase, sql: string, ...params: SqlParam[]): number {
   const result = db.prepare(sql).run(...params) as { lastInsertRowid?: number };
   return Number(result.lastInsertRowid ?? 0);
+}
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function addHours(date: Date, hours: number): string {
+  return new Date(date.getTime() + hours * 60 * 60 * 1000).toISOString();
+}
+
+function addDays(date: Date, days: number): string {
+  return new Date(date.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
+}
+
+function isProduction(): boolean {
+  return String(process.env.NODE_ENV ?? "").toLowerCase() === "production";
+}
+
+function getBaseUrl(req: Request): string {
+  const configured = process.env.APP_BASE_URL?.trim();
+  if (configured) {
+    return configured.replace(/\/$/, "");
+  }
+  return `${req.protocol}://${req.get("host") ?? "localhost:3000"}`;
+}
+
+function getSessionUser(db: AppDatabase, req: Request): SessionUserRow | undefined {
+  const cookies = parseCookies(req.headers.cookie);
+  const sessionToken = cookies.session;
+  if (!sessionToken) {
+    return undefined;
+  }
+
+  const tokenHash = hashToken(sessionToken);
+  return queryOne<SessionUserRow>(
+    db,
+    `SELECT u.user_id, u.email
+     FROM user_sessions s
+     JOIN users u ON u.user_id = s.user_id
+     WHERE s.token_hash = ? AND s.expires_at > ?`,
+    tokenHash,
+    nowIso()
+  );
+}
+
+async function sendVerificationEmail(db: AppDatabase, req: Request, userId: number, email: string): Promise<void> {
+  const mailer = createMailer();
+  const token = generateToken();
+  const tokenHash = hashToken(token);
+  const createdAt = nowIso();
+
+  execute(db, "DELETE FROM email_verification_tokens WHERE user_id = ?", userId);
+  execute(
+    db,
+    `INSERT INTO email_verification_tokens (user_id, token_hash, expires_at, used_at, created_at)
+     VALUES (?, ?, ?, ?, ?)`,
+    userId,
+    tokenHash,
+    addHours(new Date(), 24),
+    null,
+    createdAt
+  );
+
+  const verificationUrl = `${getBaseUrl(req)}/auth/verify-email?token=${encodeURIComponent(token)}`;
+  await mailer.sendMail({
+    to: email,
+    subject: "Verify your account",
+    text: `Welcome! Verify your account by visiting: ${verificationUrl}`,
+    html: `<p>Welcome!</p><p>Verify your account by visiting <a href="${escapeHtml(verificationUrl)}">${escapeHtml(verificationUrl)}</a>.</p>`,
+  });
+}
+
+async function sendPasswordResetEmail(db: AppDatabase, req: Request, userId: number, email: string): Promise<void> {
+  const mailer = createMailer();
+  const token = generateToken();
+  const tokenHash = hashToken(token);
+
+  execute(db, "DELETE FROM password_reset_tokens WHERE user_id = ?", userId);
+  execute(
+    db,
+    `INSERT INTO password_reset_tokens (user_id, token_hash, expires_at, used_at, created_at)
+     VALUES (?, ?, ?, ?, ?)`,
+    userId,
+    tokenHash,
+    addHours(new Date(), 1),
+    null,
+    nowIso()
+  );
+
+  const resetUrl = `${getBaseUrl(req)}/auth/reset-password?token=${encodeURIComponent(token)}`;
+  await mailer.sendMail({
+    to: email,
+    subject: "Reset your password",
+    text: `Reset your password by visiting: ${resetUrl}`,
+    html: `<p>Reset your password by visiting <a href="${escapeHtml(resetUrl)}">${escapeHtml(resetUrl)}</a>.</p>`,
+  });
 }
 
 export function createApp(db: AppDatabase) {
@@ -78,11 +202,11 @@ export function createApp(db: AppDatabase) {
   app.use(express.urlencoded({ extended: true }));
   app.use("/template", express.static("template"));
 
-  app.get("/health", (_req, res) => {
+  app.get("/health", (_req: Request, res: Response) => {
     res.json({ ok: true });
   });
 
-  app.get("/api/servers", (req, res) => {
+  app.get("/api/servers", (req: Request, res: Response) => {
     const limit = Math.min(parsePositiveInt(req.query.limit, 10), 100);
     const offset = Math.max(Number(req.query.offset ?? 0) || 0, 0);
     const categoryId = Number(req.query.categoryId ?? 0);
@@ -104,7 +228,7 @@ export function createApp(db: AppDatabase) {
     res.json({ servers, limit, offset });
   });
 
-  app.get("/api/servers/:id", (req, res) => {
+  app.get("/api/servers/:id", (req: Request, res: Response) => {
     const id = parsePositiveInt(req.params.id, -1);
     if (id < 1) {
       return res.status(400).json({ error: "Invalid server id." });
@@ -118,7 +242,7 @@ export function createApp(db: AppDatabase) {
     return res.json({ server });
   });
 
-  app.post("/api/servers", (req, res) => {
+  app.post("/api/servers", (req: Request, res: Response) => {
     const payload = validateServerPayload(req.body as Record<string, unknown>);
     if (!payload.valid) {
       return res.status(400).json({ error: payload.error });
@@ -149,7 +273,7 @@ export function createApp(db: AppDatabase) {
     return res.status(201).json({ serverId });
   });
 
-  app.post("/api/servers/:id/votes", (req, res) => {
+  app.post("/api/servers/:id/votes", (req: Request, res: Response) => {
     const id = parsePositiveInt(req.params.id, -1);
     if (id < 1) {
       return res.status(400).json({ error: "Invalid server id." });
@@ -172,7 +296,7 @@ export function createApp(db: AppDatabase) {
     return res.status(201).json({ success: true });
   });
 
-  app.post("/api/servers/:id/reports", (req, res) => {
+  app.post("/api/servers/:id/reports", (req: Request, res: Response) => {
     const id = parsePositiveInt(req.params.id, -1);
     if (id < 1) {
       return res.status(400).json({ error: "Invalid server id." });
@@ -200,7 +324,156 @@ export function createApp(db: AppDatabase) {
     return res.status(201).json({ success: true });
   });
 
-  app.get("/", (_req: Request, res: Response) => {
+  app.post("/api/auth/signup", async (req: Request, res: Response) => {
+    const email = normalizeEmail(String(req.body.email ?? ""));
+    const password = String(req.body.password ?? "");
+
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: "Invalid email address." });
+    }
+    if (!isValidPassword(password)) {
+      return res.status(400).json({ error: "Password must be 8-128 characters." });
+    }
+
+    const existing = queryOne<{ user_id: number }>(db, "SELECT user_id FROM users WHERE email = ?", email);
+    if (existing) {
+      return res.status(409).json({ error: "Email already registered." });
+    }
+
+    const { hash, salt } = hashPassword(password);
+    const userId = execute(
+      db,
+      "INSERT INTO users (email, password_hash, password_salt, is_email_verified, created_at) VALUES (?, ?, ?, ?, ?)",
+      email,
+      hash,
+      salt,
+      0,
+      nowIso()
+    );
+
+    await sendVerificationEmail(db, req, userId, email);
+    return res.status(201).json({ success: true, message: "Account created. Verify your email before login." });
+  });
+
+  app.get("/api/auth/verify-email", (req: Request, res: Response) => {
+    const token = String(req.query.token ?? "").trim();
+    if (!token) {
+      return res.status(400).json({ error: "Missing token." });
+    }
+
+    const tokenHash = hashToken(token);
+    const row = queryOne<{ user_id: number }>(
+      db,
+      `SELECT user_id FROM email_verification_tokens
+       WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?`,
+      tokenHash,
+      nowIso()
+    );
+
+    if (!row) {
+      return res.status(400).json({ error: "Invalid or expired token." });
+    }
+
+    execute(db, "UPDATE users SET is_email_verified = 1 WHERE user_id = ?", row.user_id);
+    execute(db, "UPDATE email_verification_tokens SET used_at = ? WHERE token_hash = ?", nowIso(), tokenHash);
+
+    return res.json({ success: true });
+  });
+
+  app.post("/api/auth/login", (req: Request, res: Response) => {
+    const email = normalizeEmail(String(req.body.email ?? ""));
+    const password = String(req.body.password ?? "");
+
+    const user = queryOne<UserRow>(db, "SELECT * FROM users WHERE email = ?", email);
+    if (!user || !verifyPassword(password, user.password_hash, user.password_salt)) {
+      return res.status(401).json({ error: "Invalid credentials." });
+    }
+    if (!user.is_email_verified) {
+      return res.status(403).json({ error: "Verify your email before logging in." });
+    }
+
+    const sessionToken = generateToken();
+    const maxAgeSeconds = 7 * 24 * 60 * 60;
+    execute(
+      db,
+      "INSERT INTO user_sessions (user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?)",
+      user.user_id,
+      hashToken(sessionToken),
+      addDays(new Date(), 7),
+      nowIso()
+    );
+
+    res.setHeader("Set-Cookie", createSessionCookie(sessionToken, maxAgeSeconds, isProduction()));
+    return res.json({ success: true });
+  });
+
+  app.post("/api/auth/logout", (req: Request, res: Response) => {
+    const cookies = parseCookies(req.headers.cookie);
+    const sessionToken = cookies.session;
+    if (sessionToken) {
+      execute(db, "DELETE FROM user_sessions WHERE token_hash = ?", hashToken(sessionToken));
+    }
+
+    res.setHeader("Set-Cookie", clearSessionCookie(isProduction()));
+    return res.json({ success: true });
+  });
+
+  app.post("/api/auth/forgot-password", async (req: Request, res: Response) => {
+    const email = normalizeEmail(String(req.body.email ?? ""));
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: "Invalid email address." });
+    }
+
+    const user = queryOne<{ user_id: number; email: string }>(db, "SELECT user_id, email FROM users WHERE email = ?", email);
+    if (user) {
+      await sendPasswordResetEmail(db, req, user.user_id, user.email);
+    }
+
+    return res.json({ success: true, message: "If the account exists, a reset email has been sent." });
+  });
+
+  app.post("/api/auth/reset-password", (req: Request, res: Response) => {
+    const token = String(req.body.token ?? "").trim();
+    const newPassword = String(req.body.newPassword ?? "");
+
+    if (!token) {
+      return res.status(400).json({ error: "Missing token." });
+    }
+    if (!isValidPassword(newPassword)) {
+      return res.status(400).json({ error: "Password must be 8-128 characters." });
+    }
+
+    const tokenHash = hashToken(token);
+    const row = queryOne<{ user_id: number }>(
+      db,
+      `SELECT user_id FROM password_reset_tokens
+       WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?`,
+      tokenHash,
+      nowIso()
+    );
+
+    if (!row) {
+      return res.status(400).json({ error: "Invalid or expired token." });
+    }
+
+    const { hash, salt } = hashPassword(newPassword);
+    execute(db, "UPDATE users SET password_hash = ?, password_salt = ? WHERE user_id = ?", hash, salt, row.user_id);
+    execute(db, "UPDATE password_reset_tokens SET used_at = ? WHERE token_hash = ?", nowIso(), tokenHash);
+    execute(db, "DELETE FROM user_sessions WHERE user_id = ?", row.user_id);
+
+    return res.json({ success: true });
+  });
+
+  app.get("/api/auth/me", (req: Request, res: Response) => {
+    const user = getSessionUser(db, req);
+    if (!user) {
+      return res.status(401).json({ error: "Not authenticated." });
+    }
+    return res.json({ user });
+  });
+
+  app.get("/", (req: Request, res: Response) => {
+    const user = getSessionUser(db, req);
     const servers = queryAll<ServerRow>(
       db,
       "SELECT * FROM servers ORDER BY votes DESC, server_id DESC LIMIT 50"
@@ -224,6 +497,11 @@ export function createApp(db: AppDatabase) {
           .join("\n")
       : "<p>No servers submitted yet.</p>";
 
+    const authMarkup = user
+      ? `<p>Signed in as <strong>${escapeHtml(user.email)}</strong></p>
+         <form method="post" action="/auth/logout"><button type="submit">Logout</button></form>`
+      : `<p><a href="/auth/login">Login</a> | <a href="/auth/signup">Sign up</a> | <a href="/auth/forgot-password">Forgot password</a></p>`;
+
     res.type("html").send(`
       <!doctype html>
       <html>
@@ -243,6 +521,7 @@ export function createApp(db: AppDatabase) {
         <body>
           <h1>Minecraft Servers List Lite</h1>
           <p>TypeScript + Express + local SQLite database</p>
+          ${authMarkup}
 
           <section>
             <h2>Submit Server</h2>
@@ -265,7 +544,238 @@ export function createApp(db: AppDatabase) {
     `);
   });
 
-  app.post("/servers/submit", (req, res) => {
+  app.get("/auth/signup", (_req: Request, res: Response) => {
+    res.type("html").send(`
+      <!doctype html>
+      <html>
+        <body>
+          <h1>Sign up</h1>
+          <form method="post" action="/auth/signup">
+            <label>Email <input type="email" name="email" required /></label>
+            <label>Password <input type="password" name="password" required minlength="8" maxlength="128" /></label>
+            <button type="submit">Create account</button>
+          </form>
+          <p><a href="/">Back</a></p>
+        </body>
+      </html>
+    `);
+  });
+
+  app.post("/auth/signup", async (req: Request, res: Response) => {
+    const email = normalizeEmail(String(req.body.email ?? ""));
+    const password = String(req.body.password ?? "");
+
+    if (!isValidEmail(email)) {
+      return res.status(400).type("text/plain").send("Invalid email address.");
+    }
+    if (!isValidPassword(password)) {
+      return res.status(400).type("text/plain").send("Password must be 8-128 characters.");
+    }
+
+    const existing = queryOne<{ user_id: number }>(db, "SELECT user_id FROM users WHERE email = ?", email);
+    if (existing) {
+      return res.status(409).type("text/plain").send("Email already registered.");
+    }
+
+    const { hash, salt } = hashPassword(password);
+    const userId = execute(
+      db,
+      "INSERT INTO users (email, password_hash, password_salt, is_email_verified, created_at) VALUES (?, ?, ?, ?, ?)",
+      email,
+      hash,
+      salt,
+      0,
+      nowIso()
+    );
+
+    await sendVerificationEmail(db, req, userId, email);
+    return res.redirect("/auth/login?signup=1");
+  });
+
+  app.get("/auth/verify-email", (req: Request, res: Response) => {
+    const token = String(req.query.token ?? "").trim();
+    if (!token) {
+      return res.status(400).type("text/plain").send("Missing token.");
+    }
+
+    const tokenHash = hashToken(token);
+    const row = queryOne<{ user_id: number }>(
+      db,
+      `SELECT user_id FROM email_verification_tokens
+       WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?`,
+      tokenHash,
+      nowIso()
+    );
+
+    if (!row) {
+      return res.status(400).type("text/plain").send("Invalid or expired token.");
+    }
+
+    execute(db, "UPDATE users SET is_email_verified = 1 WHERE user_id = ?", row.user_id);
+    execute(db, "UPDATE email_verification_tokens SET used_at = ? WHERE token_hash = ?", nowIso(), tokenHash);
+
+    return res.redirect("/auth/login?verified=1");
+  });
+
+  app.get("/auth/login", (req: Request, res: Response) => {
+    const signupMessage = req.query.signup ? "<p>Account created. Check your email for verification.</p>" : "";
+    const verifiedMessage = req.query.verified ? "<p>Email verified. You can log in now.</p>" : "";
+
+    res.type("html").send(`
+      <!doctype html>
+      <html>
+        <body>
+          <h1>Login</h1>
+          ${signupMessage}
+          ${verifiedMessage}
+          <form method="post" action="/auth/login">
+            <label>Email <input type="email" name="email" required /></label>
+            <label>Password <input type="password" name="password" required /></label>
+            <button type="submit">Login</button>
+          </form>
+          <p><a href="/auth/forgot-password">Forgot password?</a></p>
+          <p><a href="/">Back</a></p>
+        </body>
+      </html>
+    `);
+  });
+
+  app.post("/auth/login", (req: Request, res: Response) => {
+    const email = normalizeEmail(String(req.body.email ?? ""));
+    const password = String(req.body.password ?? "");
+
+    const user = queryOne<UserRow>(db, "SELECT * FROM users WHERE email = ?", email);
+    if (!user || !verifyPassword(password, user.password_hash, user.password_salt)) {
+      return res.status(401).type("text/plain").send("Invalid credentials.");
+    }
+    if (!user.is_email_verified) {
+      return res.status(403).type("text/plain").send("Verify your email before logging in.");
+    }
+
+    const sessionToken = generateToken();
+    const maxAgeSeconds = 7 * 24 * 60 * 60;
+    execute(
+      db,
+      "INSERT INTO user_sessions (user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?)",
+      user.user_id,
+      hashToken(sessionToken),
+      addDays(new Date(), 7),
+      nowIso()
+    );
+
+    res.setHeader("Set-Cookie", createSessionCookie(sessionToken, maxAgeSeconds, isProduction()));
+    return res.redirect("/");
+  });
+
+  app.post("/auth/logout", (req: Request, res: Response) => {
+    const cookies = parseCookies(req.headers.cookie);
+    const sessionToken = cookies.session;
+    if (sessionToken) {
+      execute(db, "DELETE FROM user_sessions WHERE token_hash = ?", hashToken(sessionToken));
+    }
+
+    res.setHeader("Set-Cookie", clearSessionCookie(isProduction()));
+    return res.redirect("/");
+  });
+
+  app.get("/auth/forgot-password", (_req: Request, res: Response) => {
+    res.type("html").send(`
+      <!doctype html>
+      <html>
+        <body>
+          <h1>Forgot password</h1>
+          <form method="post" action="/auth/forgot-password">
+            <label>Email <input type="email" name="email" required /></label>
+            <button type="submit">Send reset email</button>
+          </form>
+          <p><a href="/">Back</a></p>
+        </body>
+      </html>
+    `);
+  });
+
+  app.post("/auth/forgot-password", async (req: Request, res: Response) => {
+    const email = normalizeEmail(String(req.body.email ?? ""));
+    if (!isValidEmail(email)) {
+      return res.status(400).type("text/plain").send("Invalid email address.");
+    }
+
+    const user = queryOne<{ user_id: number; email: string }>(db, "SELECT user_id, email FROM users WHERE email = ?", email);
+    if (user) {
+      await sendPasswordResetEmail(db, req, user.user_id, user.email);
+    }
+
+    return res.redirect("/auth/reset-password/requested");
+  });
+
+  app.get("/auth/reset-password/requested", (_req: Request, res: Response) => {
+    res.type("html").send(`
+      <!doctype html>
+      <html>
+        <body>
+          <h1>Reset email sent</h1>
+          <p>If the account exists, a reset link was sent.</p>
+          <p><a href="/">Back</a></p>
+        </body>
+      </html>
+    `);
+  });
+
+  app.get("/auth/reset-password", (req: Request, res: Response) => {
+    const token = String(req.query.token ?? "").trim();
+    if (!token) {
+      return res.status(400).type("text/plain").send("Missing token.");
+    }
+
+    res.type("html").send(`
+      <!doctype html>
+      <html>
+        <body>
+          <h1>Reset password</h1>
+          <form method="post" action="/auth/reset-password">
+            <input type="hidden" name="token" value="${escapeHtml(token)}" />
+            <label>New password <input type="password" name="newPassword" required minlength="8" maxlength="128" /></label>
+            <button type="submit">Reset password</button>
+          </form>
+          <p><a href="/">Back</a></p>
+        </body>
+      </html>
+    `);
+  });
+
+  app.post("/auth/reset-password", (req: Request, res: Response) => {
+    const token = String(req.body.token ?? "").trim();
+    const newPassword = String(req.body.newPassword ?? "");
+
+    if (!token) {
+      return res.status(400).type("text/plain").send("Missing token.");
+    }
+    if (!isValidPassword(newPassword)) {
+      return res.status(400).type("text/plain").send("Password must be 8-128 characters.");
+    }
+
+    const tokenHash = hashToken(token);
+    const row = queryOne<{ user_id: number }>(
+      db,
+      `SELECT user_id FROM password_reset_tokens
+       WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?`,
+      tokenHash,
+      nowIso()
+    );
+
+    if (!row) {
+      return res.status(400).type("text/plain").send("Invalid or expired token.");
+    }
+
+    const { hash, salt } = hashPassword(newPassword);
+    execute(db, "UPDATE users SET password_hash = ?, password_salt = ? WHERE user_id = ?", hash, salt, row.user_id);
+    execute(db, "UPDATE password_reset_tokens SET used_at = ? WHERE token_hash = ?", nowIso(), tokenHash);
+    execute(db, "DELETE FROM user_sessions WHERE user_id = ?", row.user_id);
+
+    return res.redirect("/auth/login?reset=1");
+  });
+
+  app.post("/servers/submit", (req: Request, res: Response) => {
     const payload = validateServerPayload(req.body as Record<string, unknown>);
     if (!payload.valid) {
       return res.status(400).type("text/plain").send(payload.error);
@@ -296,7 +806,7 @@ export function createApp(db: AppDatabase) {
     return res.redirect("/");
   });
 
-  app.post("/servers/:id/vote", (req, res) => {
+  app.post("/servers/:id/vote", (req: Request, res: Response) => {
     const id = parsePositiveInt(req.params.id, -1);
     if (id < 1) {
       return res.status(400).type("text/plain").send("Invalid server id.");
