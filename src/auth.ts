@@ -1,13 +1,22 @@
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 
-const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
 export function normalizeEmail(input: string): string {
   return input.trim().toLowerCase();
 }
 
 export function isValidEmail(email: string): boolean {
-  return EMAIL_REGEX.test(email) && email.length <= 320;
+  if (email.length < 3 || email.length > 320 || email.includes(" ")) {
+    return false;
+  }
+  const at = email.indexOf("@");
+  if (at <= 0 || at !== email.lastIndexOf("@")) {
+    return false;
+  }
+  const domain = email.slice(at + 1);
+  if (!domain || domain.startsWith(".") || domain.endsWith(".")) {
+    return false;
+  }
+  return domain.includes(".");
 }
 
 export function isValidPassword(password: string): boolean {

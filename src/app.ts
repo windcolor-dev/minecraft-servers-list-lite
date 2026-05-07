@@ -41,6 +41,15 @@ type SessionUserRow = {
   email: string;
 };
 
+type RateLimitEntry = {
+  count: number;
+  resetAt: number;
+};
+
+const loginRateLimit = new Map<string, RateLimitEntry>();
+const resetTokenCookieName = "reset_token";
+const resetTokenCookieMaxAge = 60 * 60;
+
 function escapeHtml(input: string): string {
   return input
     .replaceAll("&", "&amp;")
@@ -115,12 +124,44 @@ function isProduction(): boolean {
   return String(process.env.NODE_ENV ?? "").toLowerCase() === "production";
 }
 
-function getBaseUrl(req: Request): string {
+function getBaseUrl(): string {
   const configured = process.env.APP_BASE_URL?.trim();
   if (configured) {
     return configured.replace(/\/$/, "");
   }
-  return `${req.protocol}://${req.get("host") ?? "localhost:3000"}`;
+  return "http://localhost:3000";
+}
+
+function createTransientCookie(name: string, value: string, maxAgeSeconds: number): string {
+  const securePart = isProduction() ? "; Secure" : "";
+  return `${name}=${encodeURIComponent(value)}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${maxAgeSeconds}${securePart}`;
+}
+
+function clearTransientCookie(name: string): string {
+  const securePart = isProduction() ? "; Secure" : "";
+  return `${name}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0${securePart}`;
+}
+
+function enforceRateLimit(req: Request, res: Response, key: string, maxAttempts: number, windowMs: number): boolean {
+  const source = req.ip ?? "unknown";
+  const compoundKey = `${key}:${source}`;
+  const now = Date.now();
+  const entry = loginRateLimit.get(compoundKey);
+
+  if (!entry || entry.resetAt <= now) {
+    loginRateLimit.set(compoundKey, { count: 1, resetAt: now + windowMs });
+    return true;
+  }
+
+  if (entry.count >= maxAttempts) {
+    const secondsLeft = Math.max(Math.ceil((entry.resetAt - now) / 1000), 1);
+    res.setHeader("Retry-After", String(secondsLeft));
+    return false;
+  }
+
+  entry.count += 1;
+  loginRateLimit.set(compoundKey, entry);
+  return true;
 }
 
 function getSessionUser(db: AppDatabase, req: Request): SessionUserRow | undefined {
@@ -142,7 +183,7 @@ function getSessionUser(db: AppDatabase, req: Request): SessionUserRow | undefin
   );
 }
 
-async function sendVerificationEmail(db: AppDatabase, req: Request, userId: number, email: string): Promise<void> {
+async function sendVerificationEmail(db: AppDatabase, _req: Request, userId: number, email: string): Promise<void> {
   const mailer = createMailer();
   const token = generateToken();
   const tokenHash = hashToken(token);
@@ -160,7 +201,7 @@ async function sendVerificationEmail(db: AppDatabase, req: Request, userId: numb
     createdAt
   );
 
-  const verificationUrl = `${getBaseUrl(req)}/auth/verify-email?token=${encodeURIComponent(token)}`;
+  const verificationUrl = `${getBaseUrl()}/auth/verify-email?token=${encodeURIComponent(token)}`;
   await mailer.sendMail({
     to: email,
     subject: "Verify your account",
@@ -169,7 +210,7 @@ async function sendVerificationEmail(db: AppDatabase, req: Request, userId: numb
   });
 }
 
-async function sendPasswordResetEmail(db: AppDatabase, req: Request, userId: number, email: string): Promise<void> {
+async function sendPasswordResetEmail(db: AppDatabase, _req: Request, userId: number, email: string): Promise<void> {
   const mailer = createMailer();
   const token = generateToken();
   const tokenHash = hashToken(token);
@@ -186,7 +227,7 @@ async function sendPasswordResetEmail(db: AppDatabase, req: Request, userId: num
     nowIso()
   );
 
-  const resetUrl = `${getBaseUrl(req)}/auth/reset-password?token=${encodeURIComponent(token)}`;
+  const resetUrl = `${getBaseUrl()}/auth/reset-password?token=${encodeURIComponent(token)}`;
   await mailer.sendMail({
     to: email,
     subject: "Reset your password",
@@ -381,6 +422,10 @@ export function createApp(db: AppDatabase) {
   });
 
   app.post("/api/auth/login", (req: Request, res: Response) => {
+    if (!enforceRateLimit(req, res, "api-login", 10, 15 * 60 * 1000)) {
+      return res.status(429).json({ error: "Too many login attempts. Please try again later." });
+    }
+
     const email = normalizeEmail(String(req.body.email ?? ""));
     const password = String(req.body.password ?? "");
 
@@ -641,6 +686,10 @@ export function createApp(db: AppDatabase) {
   });
 
   app.post("/auth/login", (req: Request, res: Response) => {
+    if (!enforceRateLimit(req, res, "html-login", 10, 15 * 60 * 1000)) {
+      return res.status(429).type("text/plain").send("Too many login attempts. Please try again later.");
+    }
+
     const email = normalizeEmail(String(req.body.email ?? ""));
     const password = String(req.body.password ?? "");
 
@@ -723,7 +772,25 @@ export function createApp(db: AppDatabase) {
 
   app.get("/auth/reset-password", (req: Request, res: Response) => {
     const token = String(req.query.token ?? "").trim();
-    if (!token) {
+    if (token) {
+      const tokenHash = hashToken(token);
+      const row = queryOne<{ user_id: number }>(
+        db,
+        `SELECT user_id FROM password_reset_tokens
+         WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?`,
+        tokenHash,
+        nowIso()
+      );
+      if (!row) {
+        return res.status(400).type("text/plain").send("Invalid or expired token.");
+      }
+
+      res.setHeader("Set-Cookie", createTransientCookie(resetTokenCookieName, token, resetTokenCookieMaxAge));
+      return res.redirect("/auth/reset-password");
+    }
+
+    const cookies = parseCookies(req.headers.cookie);
+    if (!cookies[resetTokenCookieName]) {
       return res.status(400).type("text/plain").send("Missing token.");
     }
 
@@ -733,7 +800,6 @@ export function createApp(db: AppDatabase) {
         <body>
           <h1>Reset password</h1>
           <form method="post" action="/auth/reset-password">
-            <input type="hidden" name="token" value="${escapeHtml(token)}" />
             <label>New password <input type="password" name="newPassword" required minlength="8" maxlength="128" /></label>
             <button type="submit">Reset password</button>
           </form>
@@ -744,7 +810,8 @@ export function createApp(db: AppDatabase) {
   });
 
   app.post("/auth/reset-password", (req: Request, res: Response) => {
-    const token = String(req.body.token ?? "").trim();
+    const cookies = parseCookies(req.headers.cookie);
+    const token = String(cookies[resetTokenCookieName] ?? "").trim();
     const newPassword = String(req.body.newPassword ?? "");
 
     if (!token) {
@@ -772,6 +839,7 @@ export function createApp(db: AppDatabase) {
     execute(db, "UPDATE password_reset_tokens SET used_at = ? WHERE token_hash = ?", nowIso(), tokenHash);
     execute(db, "DELETE FROM user_sessions WHERE user_id = ?", row.user_id);
 
+    res.setHeader("Set-Cookie", clearTransientCookie(resetTokenCookieName));
     return res.redirect("/auth/login?reset=1");
   });
 
