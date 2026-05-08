@@ -907,7 +907,9 @@ export function createApp(db: AppDatabase) {
       return res.status(404).type("text/plain").send("Server not found.");
     }
 
-    const errorMessage = req.query.error ? `<p style="color:red">${escapeHtml(String(req.query.error))}</p>` : "";
+    const errorMessage = req.query.error === "invalid_username"
+      ? `<p style="color:red">Username must be 1–32 alphanumeric characters or underscores.</p>`
+      : "";
 
     res.type("html").send(`
       <!doctype html>
@@ -948,7 +950,7 @@ export function createApp(db: AppDatabase) {
 
     const username = String(req.body.username ?? "").trim();
     if (!username || username.length > 32 || !/^[a-zA-Z0-9_]{1,32}$/.test(username)) {
-      return res.redirect(`/servers/${id}/vote?error=${encodeURIComponent("Username must be 1–32 alphanumeric characters or underscores.")}`);
+      return res.redirect(`/servers/${id}/vote?error=invalid_username`);
     }
 
     const server = queryOne<{ server_id: number }>(db, "SELECT server_id FROM servers WHERE server_id = ?", id);
