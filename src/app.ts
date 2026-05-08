@@ -313,6 +313,11 @@ export function createApp(db: AppDatabase) {
       return res.status(400).json({ error: "Invalid server id." });
     }
 
+    const username = String(req.body.username ?? "").trim();
+    if (!username || username.length > 32 || !/^[a-zA-Z0-9_]{1,32}$/.test(username)) {
+      return res.status(400).json({ error: "Username must be 1–32 alphanumeric characters or underscores." });
+    }
+
     const server = queryOne<{ server_id: number }>(db, "SELECT server_id FROM servers WHERE server_id = ?", id);
     if (!server) {
       return res.status(404).json({ error: "Server not found." });
@@ -321,9 +326,10 @@ export function createApp(db: AppDatabase) {
     execute(db, "UPDATE servers SET votes = votes + 1 WHERE server_id = ?", id);
     execute(
       db,
-      "INSERT INTO votes (server_id, ip, timestamp) VALUES (?, ?, ?)",
+      "INSERT INTO votes (server_id, ip, username, timestamp) VALUES (?, ?, ?, ?)",
       id,
       req.ip ?? "unknown",
+      username,
       Date.now()
     );
 
@@ -522,9 +528,7 @@ export function createApp(db: AppDatabase) {
                 <p><strong>Address:</strong> ${escapeHtml(server.address)}:${server.connection_port}</p>
                 <p><strong>Votes:</strong> ${server.votes}</p>
                 <p>${escapeHtml(server.description)}</p>
-                <form method="post" action="/servers/${server.server_id}/vote">
-                  <button type="submit">Vote</button>
-                </form>
+                <a href="/servers/${server.server_id}/vote"><button type="button">Vote</button></a>
               </article>
             `
           )
@@ -533,7 +537,7 @@ export function createApp(db: AppDatabase) {
 
     const authMarkup = user
       ? `<p>Signed in as <strong>${escapeHtml(user.email)}</strong></p>
-         <form method="post" action="/auth/logout"><button type="submit">Logout</button></form>`
+         <form method="post" action="/auth/logout" style="display:inline"><button type="submit">Logout</button></form>`
       : `<p><a href="/auth/login">Login</a> | <a href="/auth/signup">Sign up</a> | <a href="/auth/forgot-password">Forgot password</a></p>`;
 
     res.type("html").send(`
@@ -556,18 +560,7 @@ export function createApp(db: AppDatabase) {
           <h1>Minecraft Servers List Lite</h1>
           <p>TypeScript + Express + local SQLite database</p>
           ${authMarkup}
-
-          <section>
-            <h2>Submit Server</h2>
-            <form method="post" action="/servers/submit">
-              <label>Name <input required minlength="3" maxlength="64" name="name" /></label>
-              <label>Address <input required name="address" /></label>
-              <label>Description <textarea required minlength="10" maxlength="3000" name="description"></textarea></label>
-              <label>Connection Port <input type="number" name="connectionPort" min="1" max="65535" value="25565" /></label>
-              <label>Query Port <input type="number" name="queryPort" min="1" max="65535" value="25565" /></label>
-              <button type="submit">Submit</button>
-            </form>
-          </section>
+          <p><a href="/servers/submit">&#43; Submit a Server</a></p>
 
           <section>
             <h2>Top Servers</h2>
@@ -830,7 +823,49 @@ export function createApp(db: AppDatabase) {
     return res.redirect("/auth/login?reset=1");
   });
 
+  app.get("/servers/submit", (req: Request, res: Response) => {
+    const user = getSessionUser(db, req);
+    if (!user) {
+      return res.redirect("/auth/login");
+    }
+
+    res.type("html").send(`
+      <!doctype html>
+      <html>
+        <head>
+          <meta charset="utf-8" />
+          <meta name="viewport" content="width=device-width, initial-scale=1" />
+          <title>Submit a Server – Minecraft Servers List Lite</title>
+          <style>
+            body { font-family: Arial, sans-serif; margin: 2rem auto; max-width: 640px; line-height: 1.45; padding: 0 1rem; }
+            label { display: block; margin-top: 0.5rem; }
+            input, textarea { width: 100%; max-width: 100%; padding: 0.5rem; box-sizing: border-box; }
+            button { margin-top: 0.75rem; padding: 0.5rem 1rem; cursor: pointer; }
+          </style>
+        </head>
+        <body>
+          <h1>Submit a Server</h1>
+          <p>Signed in as <strong>${escapeHtml(user.email)}</strong></p>
+          <form method="post" action="/servers/submit">
+            <label>Name <input required minlength="3" maxlength="64" name="name" /></label>
+            <label>Address <input required name="address" /></label>
+            <label>Description <textarea required minlength="10" maxlength="3000" name="description"></textarea></label>
+            <label>Connection Port <input type="number" name="connectionPort" min="1" max="65535" value="25565" /></label>
+            <label>Query Port <input type="number" name="queryPort" min="1" max="65535" value="25565" /></label>
+            <button type="submit">Submit</button>
+          </form>
+          <p><a href="/">Back</a></p>
+        </body>
+      </html>
+    `);
+  });
+
   app.post("/servers/submit", (req: Request, res: Response) => {
+    const user = getSessionUser(db, req);
+    if (!user) {
+      return res.redirect("/auth/login");
+    }
+
     const payload = validateServerPayload(req.body as Record<string, unknown>);
     if (!payload.valid) {
       return res.status(400).type("text/plain").send(payload.error);
@@ -861,10 +896,59 @@ export function createApp(db: AppDatabase) {
     return res.redirect("/");
   });
 
+  app.get("/servers/:id/vote", (req: Request, res: Response) => {
+    const id = parsePositiveInt(req.params.id, -1);
+    if (id < 1) {
+      return res.status(400).type("text/plain").send("Invalid server id.");
+    }
+
+    const server = queryOne<ServerRow>(db, "SELECT * FROM servers WHERE server_id = ?", id);
+    if (!server) {
+      return res.status(404).type("text/plain").send("Server not found.");
+    }
+
+    const errorMessage = req.query.error ? `<p style="color:red">${escapeHtml(String(req.query.error))}</p>` : "";
+
+    res.type("html").send(`
+      <!doctype html>
+      <html>
+        <head>
+          <meta charset="utf-8" />
+          <meta name="viewport" content="width=device-width, initial-scale=1" />
+          <title>Vote – ${escapeHtml(server.name)} – Minecraft Servers List Lite</title>
+          <style>
+            body { font-family: Arial, sans-serif; margin: 2rem auto; max-width: 480px; line-height: 1.45; padding: 0 1rem; }
+            label { display: block; margin-top: 0.5rem; }
+            input { width: 100%; max-width: 100%; padding: 0.5rem; box-sizing: border-box; }
+            button { margin-top: 0.75rem; padding: 0.5rem 1rem; cursor: pointer; }
+          </style>
+        </head>
+        <body>
+          <h1>Vote for ${escapeHtml(server.name)}</h1>
+          <p><strong>Address:</strong> ${escapeHtml(server.address)}:${server.connection_port}</p>
+          <p><strong>Current votes:</strong> ${server.votes}</p>
+          ${errorMessage}
+          <form method="post" action="/servers/${server.server_id}/vote">
+            <label>Minecraft Username
+              <input required name="username" minlength="1" maxlength="32" pattern="[a-zA-Z0-9_]{1,32}" placeholder="e.g. Steve" />
+            </label>
+            <button type="submit">Vote</button>
+          </form>
+          <p><a href="/">Back</a></p>
+        </body>
+      </html>
+    `);
+  });
+
   app.post("/servers/:id/vote", (req: Request, res: Response) => {
     const id = parsePositiveInt(req.params.id, -1);
     if (id < 1) {
       return res.status(400).type("text/plain").send("Invalid server id.");
+    }
+
+    const username = String(req.body.username ?? "").trim();
+    if (!username || username.length > 32 || !/^[a-zA-Z0-9_]{1,32}$/.test(username)) {
+      return res.redirect(`/servers/${id}/vote?error=${encodeURIComponent("Username must be 1–32 alphanumeric characters or underscores.")}`);
     }
 
     const server = queryOne<{ server_id: number }>(db, "SELECT server_id FROM servers WHERE server_id = ?", id);
@@ -875,9 +959,10 @@ export function createApp(db: AppDatabase) {
     execute(db, "UPDATE servers SET votes = votes + 1 WHERE server_id = ?", id);
     execute(
       db,
-      "INSERT INTO votes (server_id, ip, timestamp) VALUES (?, ?, ?)",
+      "INSERT INTO votes (server_id, ip, username, timestamp) VALUES (?, ?, ?, ?)",
       id,
       req.ip ?? "unknown",
+      username,
       Date.now()
     );
 

@@ -37,6 +37,7 @@ export function openDatabase(): AppDatabase {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       server_id INTEGER NOT NULL,
       ip TEXT NOT NULL,
+      username TEXT NOT NULL DEFAULT '',
       timestamp INTEGER NOT NULL,
       FOREIGN KEY (server_id) REFERENCES servers(server_id)
     );
@@ -94,6 +95,12 @@ export function openDatabase(): AppDatabase {
     CREATE INDEX IF NOT EXISTS idx_verify_tokens_user_id ON email_verification_tokens(user_id);
     CREATE INDEX IF NOT EXISTS idx_reset_tokens_user_id ON password_reset_tokens(user_id);
   `);
+
+  // Migration: add username column to votes if it does not exist yet.
+  const voteColumns = db.prepare("PRAGMA table_info(votes)").all() as { name: string }[];
+  if (!voteColumns.some((c) => c.name === "username")) {
+    db.exec("ALTER TABLE votes ADD COLUMN username TEXT NOT NULL DEFAULT ''");
+  }
 
   const categoryCount = db
     .prepare("SELECT COUNT(*) as count FROM categories")
