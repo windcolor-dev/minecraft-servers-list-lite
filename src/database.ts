@@ -1,8 +1,8 @@
 import path from "node:path";
 import fs from "node:fs";
-import { DatabaseSync } from "node:sqlite";
+import Database from "better-sqlite3";
 
-export type AppDatabase = DatabaseSync;
+export type AppDatabase = Database.Database;
 
 const dataDir = path.resolve(process.cwd(), "data");
 const dbPath = path.join(dataDir, "minecraft-servers-list.db");
@@ -10,9 +10,8 @@ const dbPath = path.join(dataDir, "minecraft-servers-list.db");
 export function openDatabase(): AppDatabase {
   fs.mkdirSync(dataDir, { recursive: true });
 
-  const db = new DatabaseSync(dbPath);
-
-  db.exec("PRAGMA foreign_keys = ON;");
+  const db = new Database(dbPath);
+  db.pragma("foreign_keys = ON");
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS categories (
