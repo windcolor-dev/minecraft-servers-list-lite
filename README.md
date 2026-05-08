@@ -1,43 +1,92 @@
-# Minecraft Servers List - Lite Version
+# Minecraft Servers List - TypeScript Edition
 
-Hello everyone! I've created this lite version of the [Minecraft Servers List](http://bit.ly/minecraft-servers-list) Script that doesn't require a lot of server power and also it is easy to maintain. 
+This project has been rewritten to use **TypeScript** and a **local SQLite database**.
 
-**This code is free for everybody to use for personal purposes. It is strictly prohibited to resell any part of the code.**
+## Stack
 
-## Preview
+- Node.js + Express
+- TypeScript
+- SQLite (local file in `data/minecraft-servers-list.db`)
+- Cookie-based session auth
+- SMTP email flows via Nodemailer
 
-![Screenshot 1](http://i.imgur.com/aFZXjmc.png)
+## Features
 
-![Screenshot 2](http://imgur.com/M9Mb6fM.png)
+- Submit Minecraft servers
+- List top servers by votes
+- Vote for servers
+- Report servers
+- JSON API endpoints for integration
+- Sign up + email verification
+- Login + logout
+- Forgot password + reset password by email
 
-![Screenshot 3](http://imgur.com/FX3kkvu.png)
+## Quick start
 
-![Screenshot 4](http://imgur.com/Sa13ENf.png)
+1. Install Node.js 20+.
+2. Install dependencies:
 
-![Screenshot 5](http://imgur.com/PMkH8Qk.png)
+   ```bash
+   npm install
+   ```
 
+3. (Optional) Configure SMTP to send real emails:
 
-## How to install
-1. Open your FTP and connect to your server
-2. Upload the scripts content
-3. Make sure you uploaded the .htaccess file
-4. CHMOD 777 the core/database/connect.php file
-5. Access http://yourdomain.com/install.php with your browser
-6. Enter the required details and hit enter. If there are no errors delete the install.php
+   ```bash
+   export SMTP_HOST=smtp.example.com
+   export SMTP_PORT=587
+   export SMTP_SECURE=false
+   export SMTP_USER=your-user
+   export SMTP_PASS=your-pass
+   export MAIL_FROM="Minecraft List <noreply@example.com>"
+   export APP_BASE_URL=http://localhost:3000
+   ```
 
-You can now login with your admin account( Username: admin ; Password: admin ) by accessing the ** /login ** url.
+   If SMTP is not configured, emails are logged to console in development fallback mode.
 
-## Requirements
+4. Start in development mode:
 
-* PHP 5.5 or higher
-* MySQLi
-* Rewrite Engine (htaccess)
-* file_get_contents() enabled
+   ```bash
+   npm run dev
+   ```
 
-## Contact
-You can contact me for support or freelance work at:
+5. Open `http://localhost:3000`.
 
-* **Skype:** neeesteea.soda
-* **Email:** gfabruno@gmail.com
-* **Website:** GrohsFabian.com
-* **Twitter:** @GrohsFabian
+## Build and run
+
+```bash
+npm run build
+npm start
+```
+
+## API
+
+### Servers
+
+- `GET /api/servers`
+- `GET /api/servers/:id`
+- `POST /api/servers`
+- `POST /api/servers/:id/votes`
+- `POST /api/servers/:id/reports`
+
+### Auth
+
+- `POST /api/auth/signup`
+- `GET /api/auth/verify-email?token=...`
+- `POST /api/auth/login`
+- `POST /api/auth/logout`
+- `POST /api/auth/forgot-password`
+- `POST /api/auth/reset-password`
+- `GET /api/auth/me`
+
+## HTML flows
+
+- `GET /auth/signup`
+- `GET /auth/login`
+- `GET /auth/verify-email?token=...`
+- `GET /auth/forgot-password`
+- `GET /auth/reset-password?token=...`
+
+## Database
+
+The app automatically creates the SQLite schema on startup and seeds a default category.
