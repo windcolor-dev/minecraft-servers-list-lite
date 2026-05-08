@@ -42,7 +42,24 @@ type SessionUserRow = {
   email: string;
 };
 
+type CategoryRow = {
+  category_id: number;
+  name: string;
+};
+
 const resetTokenCookieName = "reset_token";
+
+const htmlFormErrors: Record<string, string> = {
+  invalid_email: "Invalid email address.",
+  invalid_password: "Password must be between 8 and 128 characters.",
+  email_taken: "That email address is already registered.",
+  invalid_credentials: "Invalid email or password.",
+  email_not_verified: "Please verify your email address before logging in.",
+  invalid_payload: "Please review your submission — name (3–64 chars), valid hostname address, description (10–3000 chars).",
+  category_not_found: "The selected category was not found.",
+  invalid_token: "This link is invalid or has expired.",
+  invalid_username: "Minecraft username must be 1–32 alphanumeric characters or underscores.",
+};
 const resetTokenCookieMaxAge = 60 * 60;
 const authRateLimitWindowMs = 15 * 60 * 1000;
 const authRateLimitMax = 10;
